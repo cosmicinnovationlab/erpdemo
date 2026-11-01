@@ -1,0 +1,1682 @@
+"use client";
+
+import React, { useState, useEffect, useMemo } from "react";
+import {
+  BarChart3,
+  Calendar,
+  Download,
+  Search,
+  RefreshCw,
+  Wallet,
+  CreditCard,
+  TrendingUp,
+  Users,
+  Shield,
+  Building2,
+  UserCheck,
+  AlertTriangle,
+  Eye,
+  Layers,
+  FileSpreadsheet,
+  Printer,
+  ShieldCheck,
+  XCircle,
+} from "lucide-react";
+import { filterDealsForUser } from "@/lib/dealUtils";
+import ReportPrintSheet from "@/components/ReportPrintSheet";
+
+/* ---------------------------------------------------------------------- */
+/*  Helper Constants & Utilities                                           */
+/* ---------------------------------------------------------------------- */
+
+const BRANCHES = ["Sasaram", "Bihiya", "Buxas", "Mohaniya"];
+
+const PAYMENT_MODES = [
+  "Cash",
+  "Cheque",
+  "NEFT/RTGS",
+  "Financer Disbursement",
+  "Exchange Vehicle",
+  "Advance Adjustment",
+];
+
+const STATUS_META = {
+  draft: { label: "Draft", color: "#6B7280", bg: "#F1F2F4" },
+  pending_approval: { label: "Pending Approval", color: "#B5461C", bg: "#FBEAE0" },
+  rejected: { label: "Rejected", color: "#B91C1C", bg: "#FDE8E8" },
+  approved: { label: "Approved · Collecting", color: "#1B4F9C", bg: "#E7EEF9" },
+  delivered: { label: "Delivered", color: "#7C3AED", bg: "#EDE6FB" },
+  closed: { label: "Closed", color: "#1E7A4C", bg: "#E4F3EA" },
+};
+
+const num = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
+const inr = (v) => "₹" + Math.round(num(v)).toLocaleString("en-IN");
+
+function normalizeBranch(b) {
+  if (!b) return "Sasaram";
+  const lower = String(b).toLowerCase().trim();
+  if (lower.includes("bihiya")) return "Bihiya";
+  if (lower.includes("buxa")) return "Buxas";
+  if (lower.includes("mohan")) return "Mohaniya";
+  if (lower.includes("sasaram")) return "Sasaram";
+  return b;
+}
+
+function paymentStatus(e) {
+  if (e.status) return e.status;
+  return e.verified ? "verified" : "pending";
+}
+
+function calcDeal(deal) {
+  const p = deal.pricing || {};
+  const otherDiscountsTotal = (p.otherDiscounts || []).reduce((s, o) => s + num(o.amount), 0);
+  const netPrice =
+    num(p.exshowroom) -
+    num(p.tmlDiscount) -
+    num(p.dealerDiscount) -
+    num(p.vasNfaDiscount) -
+    otherDiscountsTotal;
+
+  // Auto-calculated TCS: 1% on net price only if net price > 10,00,000 (10 Lakhs)
+  const tcs = netPrice > 1000000 ? Math.round(netPrice * 0.01) : 0;
+
+  const adds = [
+    "tr",
+    "insurance",
+    "registration",
+    "permit",
+    "fleetedgeVltd",
+    "vasAmc",
+    "bodyFabCharge",
+    "choiceHsrp",
+    "transportation",
+  ].reduce((s, k) => s + num(p[k]), tcs);
+
+  const totalOnRoad = netPrice + adds;
+  const netOnRoad = totalOnRoad - num(p.exchangeBonus);
+
+  const totalCollected = (deal.paymentLog || [])
+    .filter((e) => paymentStatus(e) !== "rejected")
+    .reduce((s, e) => s + num(e.amount), 0);
+
+  const approvedAdjustments = (deal.adjustments || [])
+    .filter((a) => a.status === "approved")
+    .reduce((s, a) => s + num(a.amount), 0);
+
+  const pendingAdjustments = (deal.adjustments || [])
+    .filter((a) => a.status === "pending")
+    .reduce((s, a) => s + num(a.amount), 0);
+
+  const balance = netOnRoad - (typeof netCollected !== "undefined" ? netCollected : totalCollected) - approvedAdjustments;
+
+  return {
+    netPrice,
+    tcs,
+    totalOnRoad,
+    netOnRoad,
+    totalCollected,
+    approvedAdjustments,
+    pendingAdjustments,
+    balance,
+    outstandingDue: Math.max(0, balance),
+    otherDiscountsTotal,
+  };
+}
+
+function getDealDateObj(d) {
+  if (d.createdAt) {
+    const dt = new Date(d.createdAt);
+    if (!isNaN(dt.getTime())) return dt;
+  }
+  if (d.activity && d.activity[0]?.at) {
+    const dt = new Date(d.activity[0].at);
+    if (!isNaN(dt.getTime())) return dt;
+  }
+  if (d.approval?.at) {
+    const dt = new Date(d.approval.at);
+    if (!isNaN(dt.getTime())) return dt;
+  }
+  return new Date();
+}
+
+function getDayKey(dt) {
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+}
+
+function getMonthKey(dt) {
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function formatDisplayDate(dateObj) {
+  return dateObj.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function getSalesmanName(d) {
+  return (d.vehicle?.dse || d.createdBy || "Unassigned").trim();
+}
+
+function formatCustomer(customer) {
+  if (!customer) return "Untitled customer";
+  const comp = (customer.companyName || "").trim();
+  const name = (customer.name || "").trim();
+  if (comp && name) return `${comp} (${name})`;
+  return comp || name || "Untitled customer";
+}
+
+// One full-detail row per deal — shared by the Excel and CSV exports so they never drift apart.
+function buildLedgerRows(list) {
+  return list.map(({ d, c, dt, salesman, branchNorm }) => {
+    const validPayments = (d.paymentLog || []).filter((p) => paymentStatus(p) !== "rejected");
+    const modes = validPayments.map((p) => p.mode).filter(Boolean).join("; ");
+    const refs = validPayments
+      .map((p) => (p.reference ? `${p.mode}: ${p.reference}` : p.mode))
+      .filter(Boolean)
+      .join("; ");
+    const paymentDates = validPayments.map((p) => p.date).filter(Boolean).join("; ");
+    const otherDiscountsStr = (d.pricing?.otherDiscounts || [])
+      .map((o) => `${o.label || "Discount"}: ₹${o.amount}`)
+      .join("; ");
+
+    const cust = d.customer || {};
+    const veh = d.vehicle || {};
+    const pr = d.pricing || {};
+    const off = d.officeUse || {};
+    const app = d.approval || {};
+    const expCl = d.expenseClosed || {};
+
+    return {
+      "Deal ID": d.id || "",
+      "Deal Date": formatDisplayDate(dt),
+      "Dealership Branch": branchNorm || "Sasaram",
+      "Deal Status": STATUS_META[d.status]?.label || d.status || "",
+      "Approval Status": app.status || d.status || "",
+      "Approved / Actioned By": app.by || "",
+      "Approval Date": app.at || "",
+      "Approval Remarks": app.remarks || "",
+      "Created By": d.createdBy || "",
+      "Created By Username": d.createdByUsername || "",
+      "Salesman (DSE)": salesman || veh.dse || d.createdBy || "Unassigned",
+      DSM: veh.dsm || "",
+      "Customer Name": cust.name || "",
+      "Company Name": cust.companyName || "",
+      "S/o, W/o, D/o": cust.soWo || "",
+      "DOB / Age": cust.dob || "",
+      Mobile: cust.mobile || "",
+      "PAN No": cust.pan || "",
+      "Aadhar No": cust.aadhar || "",
+      "GST No": cust.gstNo || "",
+      Address: cust.address || "",
+      "P.O.": cust.po || "",
+      "P.S.": cust.ps || "",
+      District: cust.district || "",
+      PIN: cust.pin || "",
+      State: cust.state || "",
+      Model: veh.model || "",
+      Colour: veh.colour || "",
+      "Body Type": veh.bodyType || "",
+      "Chassis No": veh.chassisNo || "",
+      "Engine No": veh.engineNo || "",
+      "Fuel Type": veh.fuelType || "",
+      DOD: veh.dod || "",
+      "Financer Name": veh.financerName || "",
+      RTO: veh.rto || "",
+      "Exshowroom Price (INR)": num(pr.exshowroom),
+      "TML Cash Discount (INR)": num(pr.tmlDiscount),
+      "Dealer Discount (INR)": num(pr.dealerDiscount),
+      "VAS NFA Discount (INR)": num(pr.vasNfaDiscount),
+      "Other Discounts Breakdown": otherDiscountsStr || "",
+      "Other Discounts Total (INR)": c.otherDiscountsTotal || 0,
+      "Net Price of Vehicle (INR)": c.netPrice || 0,
+      "TCS 1% (INR)": c.tcs || 0,
+      "TR Charge (INR)": num(pr.tr),
+      "Insurance (INR)": num(pr.insurance),
+      "Registration (INR)": num(pr.registration),
+      "Permit (INR)": num(pr.permit),
+      "Fleetedge / VLTD (INR)": num(pr.fleetedgeVltd),
+      "VAS (AMC/FMS) (INR)": num(pr.vasAmc),
+      "Body Fabrication Charge (INR)": num(pr.bodyFabCharge),
+      "Choice No + HSRP (INR)": num(pr.choiceHsrp),
+      "Transportation (INR)": num(pr.transportation),
+      "Total On-Road Price (INR)": c.totalOnRoad || 0,
+      "Exchange Bonus (INR)": num(pr.exchangeBonus),
+      "NET ON-ROAD PRICE (INR)": c.netOnRoad || 0,
+      "Total Collected (INR)": c.totalCollected || 0,
+      "Outstanding Due (INR)": c.outstandingDue || 0,
+      "Approved Adjustments (INR)": c.approvedAdjustments || 0,
+      "Pending Adjustments (INR)": c.pendingAdjustments || 0,
+      "Net Balance (INR)": c.balance || 0,
+      "Payment Modes": modes || "None",
+      "Payment UTR / Cheque Ref": refs || "None",
+      "Payment Dates": paymentDates || "None",
+      "Payment Transactions Count": validPayments.length,
+      "Office Remarks": off.remarks || "",
+      "Body Fab Name": off.bodyFabName || "",
+      "Interest Cost (INR)": num(off.interestCost),
+      "Retention on Vehicle (INR)": num(off.retentionVehicle),
+      "Retention on Body (INR)": num(off.retentionBody),
+      "Retention on VAS (INR)": num(off.retentionVas),
+      "Retention on Others (INR)": num(off.retentionOthers),
+      "Insurance Expense Closed": expCl.insurance ? "Yes" : "No",
+      "HSRP Expense Closed": expCl.hsrp ? "Yes" : "No",
+      "TR Expense Closed": expCl.tr ? "Yes" : "No",
+      "Registration Expense Closed": expCl.registration ? "Yes" : "No",
+    };
+  });
+}
+
+function startOfWeekMonday(now) {
+  const s = new Date(now);
+  const day = s.getDay();
+  s.setDate(s.getDate() + ((day === 0 ? -6 : 1) - day));
+  s.setHours(0, 0, 0, 0);
+  return s;
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Main Component: ReportsDashboard                                       */
+/* ---------------------------------------------------------------------- */
+
+export default function ReportsDashboard({ deals = [], session, onOpen }) {
+  const isAdmin = session?.role === "admin" || session?.role === "superadmin";
+  const isSuperAdmin = session?.role === "superadmin";
+  const isSales = session?.role === "sales";
+
+  // When salesman, strictly scope incoming deals to his own deals
+  const scopedDeals = useMemo(() => {
+    if (isSales) return filterDealsForUser(deals, session);
+    return deals;
+  }, [deals, isSales, session]);
+
+  // Filter States
+  const [timePreset, setTimePreset] = useState("all"); // 'all' | 'today' | 'this_week' | 'this_month' | 'this_year' | 'custom'
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [salesmanFilter, setSalesmanFilter] = useState("all");
+  const [branchFilter, setBranchFilter] = useState("all");
+  const [paymentModeFilter, setPaymentModeFilter] = useState("all");
+  const [paymentStatusFilter, setPaymentStatusFilter] = useState("all"); // 'all' | 'dues' | 'settled' | 'partial'
+  const [approvalStatusFilter, setApprovalStatusFilter] = useState("all"); // 'all' | 'approved' | 'pending' | 'rejected'
+  const [searchQuery, setSearchQuery] = useState("");
+
+  // Sub-tab view state
+  const [activeView, setActiveView] = useState("ledger"); // 'ledger' | 'timeline' | 'salesmen'
+  const [timelineGrouping, setTimelineGrouping] = useState("day"); // 'day' | 'week' | 'month'
+
+  // If non-admin attempts to view salesmen leaderboard, revert to ledger
+  useEffect(() => {
+    if (!isAdmin && activeView === "salesmen") setActiveView("ledger");
+  }, [isAdmin, activeView]);
+
+  // Registered salesmen list from API (for admin)
+  const [registeredSalesmen, setRegisteredSalesmen] = useState([]);
+
+  useEffect(() => {
+    if (isAdmin) {
+      (async () => {
+        try {
+          const res = await fetch("/api/users");
+          if (res.ok) {
+            const data = await res.json();
+            if (data.users) {
+              setRegisteredSalesmen(
+                data.users.filter((u) => u.role === "sales" || u.role === "admin" || u.role === "superadmin").map((u) => u.name)
+              );
+            }
+          }
+        } catch (e) {
+          console.warn("Could not load users for salesman dropdown", e);
+        }
+      })();
+    }
+  }, [isAdmin]);
+
+  // All distinct salesmen gathered from deals and users list (Admin only)
+  const allSalesmen = useMemo(() => {
+    if (isSales) return [session?.name || "My Deals"].filter(Boolean);
+    const fromDeals = scopedDeals.map((d) => getSalesmanName(d)).filter(Boolean);
+    return Array.from(new Set([...fromDeals, ...registeredSalesmen])).sort();
+  }, [scopedDeals, registeredSalesmen, isSales, session]);
+
+  // Pre-calculate Deals with Calculations & Date Objects
+  const dealsWithCalc = useMemo(() => {
+    return scopedDeals.map((d) => {
+      const dt = getDealDateObj(d);
+      return {
+        d,
+        c: calcDeal(d),
+        dt,
+        dayKey: getDayKey(dt),
+        monthKey: getMonthKey(dt),
+        salesman: getSalesmanName(d),
+        branchNorm: normalizeBranch(d.branch),
+      };
+    });
+  }, [scopedDeals]);
+
+  // Overall Counters (Today, This Week, This Month, This Year)
+  const quickCounters = useMemo(() => {
+    const now = new Date();
+    const todayKey = getDayKey(now);
+    const startOfWeek = startOfWeekMonday(now);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfYear = new Date(now.getFullYear(), 0, 1);
+
+    const out = {
+      today: { count: 0, net: 0, collected: 0 },
+      week: { count: 0, net: 0, collected: 0 },
+      month: { count: 0, net: 0, collected: 0 },
+      year: { count: 0, net: 0, collected: 0 },
+    };
+    const add = (k, item) => {
+      out[k].count++;
+      out[k].net += item.c.netOnRoad;
+      out[k].collected += item.c.totalCollected;
+    };
+
+    dealsWithCalc.forEach((item) => {
+      if (item.dayKey === todayKey) add("today", item);
+      if (item.dt >= startOfWeek) add("week", item);
+      if (item.dt >= startOfMonth) add("month", item);
+      if (item.dt >= startOfYear) add("year", item);
+    });
+    return out;
+  }, [dealsWithCalc]);
+
+  // Filtered Deals
+  const filteredDeals = useMemo(() => {
+    const now = new Date();
+    const todayKey = getDayKey(now);
+    const startOfWeek = startOfWeekMonday(now);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfYear = new Date(now.getFullYear(), 0, 1);
+    const q = searchQuery.trim().toLowerCase();
+
+    return dealsWithCalc.filter((item) => {
+      const { d, c, dt, dayKey, salesman, branchNorm } = item;
+
+      // 1. Time Presets
+      if (timePreset === "today" && dayKey !== todayKey) return false;
+      if (timePreset === "this_week" && dt < startOfWeek) return false;
+      if (timePreset === "this_month" && dt < startOfMonth) return false;
+      if (timePreset === "this_year" && dt < startOfYear) return false;
+      if (timePreset === "custom") {
+        if (fromDate && dt < new Date(fromDate + "T00:00:00")) return false;
+        if (toDate && dt > new Date(toDate + "T23:59:59")) return false;
+      }
+
+      // 2. Salesman Filter (Admin only)
+      if (isAdmin && salesmanFilter !== "all") {
+        if (salesman.toLowerCase() !== salesmanFilter.toLowerCase()) return false;
+      }
+
+      // 3. Branch Filter
+      if (branchFilter !== "all" && branchNorm.toLowerCase() !== branchFilter.toLowerCase()) return false;
+
+      // 4. Payment Mode Filter
+      if (paymentModeFilter !== "all") {
+        const hasMode = (d.paymentLog || []).some(
+          (p) => p.mode === paymentModeFilter && paymentStatus(p) !== "rejected"
+        );
+        if (!hasMode) return false;
+      }
+
+      // 5. Payment Status Filter
+      if (paymentStatusFilter === "dues" && c.balance <= 0) return false;
+      if (paymentStatusFilter === "settled" && c.balance > 0) return false;
+      if (paymentStatusFilter === "partial" && !(c.totalCollected > 0 && c.balance > 0)) return false;
+
+      // 6. Approval / Deal Status Filter
+      if (approvalStatusFilter === "approved") {
+        const isApp =
+          d.status === "approved" ||
+          d.status === "delivered" ||
+          d.status === "closed" ||
+          d.approval?.status === "approved";
+        if (!isApp) return false;
+      } else if (approvalStatusFilter === "pending") {
+        const isPend =
+          d.status === "pending_approval" ||
+          d.status === "draft" ||
+          d.approval?.status === "pending_approval" ||
+          d.approval?.status === "draft" ||
+          d.approval?.status === "pending";
+        if (!isPend) return false;
+      } else if (approvalStatusFilter === "rejected") {
+        if (!(d.status === "rejected" || d.approval?.status === "rejected")) return false;
+      }
+
+      // 7. Search Query
+      if (q) {
+        const utrReferences = (d.paymentLog || [])
+          .map((p) => p.reference || "")
+          .filter(Boolean)
+          .join(" ");
+        const matchText = [
+          d.id,
+          d.customer?.name,
+          d.customer?.companyName,
+          d.customer?.mobile,
+          d.customer?.gstNo,
+          d.vehicle?.chassisNo,
+          d.vehicle?.model,
+          d.vehicle?.dse,
+          d.createdBy,
+          d.branch,
+          utrReferences,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        if (!matchText.includes(q)) return false;
+      }
+
+      return true;
+    });
+  }, [
+    dealsWithCalc,
+    isAdmin,
+    timePreset,
+    fromDate,
+    toDate,
+    salesmanFilter,
+    branchFilter,
+    paymentModeFilter,
+    paymentStatusFilter,
+    approvalStatusFilter,
+    searchQuery,
+  ]);
+
+  // Aggregated KPI Totals for Filtered Set
+  const metrics = useMemo(() => {
+    let totalNet = 0;
+    let totalCollected = 0;
+    let totalDue = 0;
+    let duesCount = 0;
+    const modeTotals = {
+      Cash: 0,
+      Cheque: 0,
+      "NEFT/RTGS": 0,
+      "Financer Disbursement": 0,
+      "Exchange Vehicle": 0,
+      "Advance Adjustment": 0,
+    };
+    let utrCount = 0;
+
+    filteredDeals.forEach(({ d, c }) => {
+      totalNet += c.netOnRoad;
+      totalCollected += c.totalCollected;
+      if (c.balance > 0) {
+        totalDue += c.balance;
+        duesCount++;
+      }
+      (d.paymentLog || []).forEach((p) => {
+        if (paymentStatus(p) !== "rejected") {
+          const m = p.mode || "Other";
+          modeTotals[m] = (modeTotals[m] || 0) + num(p.amount);
+          if (m === "NEFT/RTGS" && p.reference) utrCount++;
+        }
+      });
+    });
+
+    return {
+      totalNet,
+      totalCollected,
+      totalDue,
+      duesCount,
+      collectionRate: totalNet > 0 ? Math.min(100, Math.round((totalCollected / totalNet) * 100)) : 0,
+      avgDeal: filteredDeals.length > 0 ? Math.round(totalNet / filteredDeals.length) : 0,
+      modeTotals,
+      utrCount,
+    };
+  }, [filteredDeals]);
+
+  // Branch Breakdown Overview for Filtered Set
+  const branchBreakdown = useMemo(() => {
+    return BRANCHES.map((b) => {
+      const list = filteredDeals.filter((x) => x.branchNorm === b);
+      return {
+        branch: b,
+        count: list.length,
+        net: list.reduce((s, x) => s + x.c.netOnRoad, 0),
+        collected: list.reduce((s, x) => s + x.c.totalCollected, 0),
+        balance: list.reduce((s, x) => s + x.c.outstandingDue, 0),
+      };
+    });
+  }, [filteredDeals]);
+
+  // Salesman Breakdown for Leaderboard Table
+  const salesmanLeaderboard = useMemo(() => {
+    const map = {};
+    const blankRow = (name, branch) => ({ name, branch, count: 0, todayCount: 0, net: 0, collected: 0, balance: 0 });
+    allSalesmen.forEach((sm) => {
+      map[sm] = blankRow(sm, "—");
+    });
+    const todayKey = getDayKey(new Date());
+
+    filteredDeals.forEach(({ c, salesman, branchNorm, dayKey }) => {
+      if (!map[salesman]) map[salesman] = blankRow(salesman, branchNorm);
+      const row = map[salesman];
+      row.count++;
+      if (dayKey === todayKey) row.todayCount++;
+      row.net += c.netOnRoad;
+      row.collected += c.totalCollected;
+      row.balance += c.outstandingDue;
+      if (row.branch === "—") row.branch = branchNorm;
+    });
+
+    return Object.values(map)
+      .filter((s) => s.count > 0 || salesmanFilter === s.name)
+      .sort((a, b) => b.net - a.net);
+  }, [allSalesmen, filteredDeals, salesmanFilter]);
+
+  // Timeline Grouping (Day-wise / Week-wise / Month-wise)
+  const timelineData = useMemo(() => {
+    const groups = {};
+
+    filteredDeals.forEach((item) => {
+      let groupKey;
+      let groupLabel;
+
+      if (timelineGrouping === "day") {
+        groupKey = item.dayKey;
+        groupLabel = formatDisplayDate(item.dt);
+      } else if (timelineGrouping === "week") {
+        const d = new Date(item.dt);
+        d.setHours(0, 0, 0, 0);
+        const day = d.getDay();
+        d.setDate(d.getDate() + ((day === 0 ? -6 : 1) - day));
+        groupKey = getDayKey(d);
+        const endW = new Date(d);
+        endW.setDate(endW.getDate() + 6);
+        groupLabel = `${formatDisplayDate(d)} — ${formatDisplayDate(endW)}`;
+      } else {
+        groupKey = item.monthKey;
+        groupLabel = item.dt.toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+      }
+
+      if (!groups[groupKey]) {
+        groups[groupKey] = { key: groupKey, label: groupLabel, deals: [], net: 0, collected: 0, balance: 0 };
+      }
+      groups[groupKey].deals.push(item);
+      groups[groupKey].net += item.c.netOnRoad;
+      groups[groupKey].collected += item.c.totalCollected;
+      groups[groupKey].balance += item.c.outstandingDue;
+    });
+
+    return Object.values(groups).sort((a, b) => b.key.localeCompare(a.key));
+  }, [filteredDeals, timelineGrouping]);
+
+  const hasActiveFilters =
+    timePreset !== "all" ||
+    salesmanFilter !== "all" ||
+    branchFilter !== "all" ||
+    paymentModeFilter !== "all" ||
+    paymentStatusFilter !== "all" ||
+    approvalStatusFilter !== "all" ||
+    searchQuery.trim() !== "" ||
+    fromDate !== "" ||
+    toDate !== "";
+
+  const handleResetFilters = () => {
+    setTimePreset("all");
+    setFromDate("");
+    setToDate("");
+    setSalesmanFilter("all");
+    setBranchFilter("all");
+    setPaymentModeFilter("all");
+    setPaymentStatusFilter("all");
+    setApprovalStatusFilter("all");
+    setSearchQuery("");
+  };
+
+  const [isExporting, setIsExporting] = useState(false);
+
+  // Full Multi-Sheet Excel (.xlsx) Workbook Download
+  const downloadExcel = async () => {
+    setIsExporting(true);
+    try {
+      const XLSX = await import("xlsx");
+      const wb = XLSX.utils.book_new();
+
+      // Sheet 1: Comprehensive Sales & Dues Ledger (All Fields Included)
+      const wsLedger = XLSX.utils.json_to_sheet(buildLedgerRows(filteredDeals));
+      XLSX.utils.book_append_sheet(wb, wsLedger, isSales ? "My Sales & Dues Ledger" : "Sales & Dues Ledger");
+
+      // Sheet 2: Salesman Performance (Admin only)
+      if (isAdmin) {
+        const salesmanRows = salesmanLeaderboard.map((sm, idx) => ({
+          Rank: idx + 1,
+          "Salesman Name": sm.name,
+          "Primary Branch": sm.branch,
+          "Total Deals": sm.count,
+          "Sales Today": sm.todayCount,
+          "Net Sales Value (INR)": sm.net,
+          "Amount Collected (INR)": sm.collected,
+          "Outstanding Dues (INR)": sm.balance,
+          "Collection Efficiency (%)": sm.net > 0 ? `${Math.round((sm.collected / sm.net) * 100)}%` : "0%",
+        }));
+        const wsSalesman = XLSX.utils.json_to_sheet(salesmanRows);
+        wsSalesman["!cols"] = [8, 22, 15, 12, 12, 20, 18, 18, 20].map((wch) => ({ wch }));
+        XLSX.utils.book_append_sheet(wb, wsSalesman, "Salesman Performance");
+      }
+
+      // Sheet 3: Branch Overview (Admin only)
+      if (isAdmin) {
+        const branchRows = branchBreakdown.map((b) => ({
+          "Dealership Branch": b.branch,
+          "Total Deals": b.count,
+          "Net Order Value (INR)": b.net,
+          "Collected (INR)": b.collected,
+          "Outstanding Dues (INR)": b.balance,
+          "Collection Rate (%)": b.net > 0 ? `${Math.round((b.collected / b.net) * 100)}%` : "0%",
+        }));
+        const wsBranch = XLSX.utils.json_to_sheet(branchRows);
+        wsBranch["!cols"] = [18, 12, 20, 18, 18, 18].map((wch) => ({ wch }));
+        XLSX.utils.book_append_sheet(wb, wsBranch, "Branch Overview");
+      }
+
+      // Sheet 4: Performance Summary (per role)
+      if (isSales) {
+        const summaryRows = [
+          { "Performance Metric": "Dealership Company", Value: "magadh Autowheels Pvt. Ltd." },
+          { "Performance Metric": "Report Type", Value: "Sales Executive Personal Performance" },
+          { "Performance Metric": "Sales Executive Name", Value: session?.name || "Salesman" },
+          { "Performance Metric": "Assigned Branch", Value: normalizeBranch(session?.branch) },
+          { "Performance Metric": "My Total Sales Deals", Value: filteredDeals.length },
+          { "Performance Metric": "My Total Sales Value (INR)", Value: inr(metrics.totalNet) },
+          { "Performance Metric": "My Collected Revenue (INR)", Value: inr(metrics.totalCollected) },
+          { "Performance Metric": "My Outstanding Customer Dues (INR)", Value: inr(metrics.totalDue) },
+          { "Performance Metric": "Pending Dues Deals Count", Value: metrics.duesCount },
+          { "Performance Metric": "My Collection Efficiency (%)", Value: `${metrics.collectionRate}%` },
+          { "Performance Metric": "Average Deal Size (INR)", Value: inr(metrics.avgDeal) },
+          { "Performance Metric": "Report Generated On", Value: new Date().toLocaleString("en-IN") },
+        ];
+        const wsSummary = XLSX.utils.json_to_sheet(summaryRows);
+        wsSummary["!cols"] = [{ wch: 38 }, { wch: 28 }];
+        XLSX.utils.book_append_sheet(wb, wsSummary, "My Performance Summary");
+      } else {
+        const summaryRows = [
+          { "Key Performance Metric": "Dealership Company", Value: "magadh Autowheels Pvt. Ltd." },
+          { "Key Performance Metric": "Software System", Value: "magadh Autowheels Pvt. Ltd. ERP" },
+          { "Key Performance Metric": "Total Filtered Deals", Value: filteredDeals.length },
+          { "Key Performance Metric": "Total Net Order Value (INR)", Value: inr(metrics.totalNet) },
+          { "Key Performance Metric": "Total Collected Revenue (INR)", Value: inr(metrics.totalCollected) },
+          { "Key Performance Metric": "Total Outstanding Customer Dues (INR)", Value: inr(metrics.totalDue) },
+          { "Key Performance Metric": "Pending Dues Deals Count", Value: metrics.duesCount },
+          { "Key Performance Metric": "Overall Collection Rate", Value: `${metrics.collectionRate}%` },
+          { "Key Performance Metric": "Average Deal Size (INR)", Value: inr(metrics.avgDeal) },
+          { "Key Performance Metric": "Cash Collected (INR)", Value: inr(metrics.modeTotals["Cash"] || 0) },
+          { "Key Performance Metric": "NEFT / RTGS Collected (INR)", Value: inr(metrics.modeTotals["NEFT/RTGS"] || 0) },
+          { "Key Performance Metric": "Financer Disbursement (INR)", Value: inr(metrics.modeTotals["Financer Disbursement"] || 0) },
+          { "Key Performance Metric": "Cheque Inflow (INR)", Value: inr(metrics.modeTotals["Cheque"] || 0) },
+          { "Key Performance Metric": "Verified UTR References Count", Value: metrics.utrCount },
+          { "Key Performance Metric": "Report Generated On", Value: new Date().toLocaleString("en-IN") },
+        ];
+        const wsSummary = XLSX.utils.json_to_sheet(summaryRows);
+        wsSummary["!cols"] = [{ wch: 38 }, { wch: 26 }];
+        XLSX.utils.book_append_sheet(wb, wsSummary, "Executive Summary");
+      }
+
+      const filename = `${isSales ? "magadh_Autowheels_My_Sales_Report" : "magadh_Autowheels_Sales_Report"}_${new Date()
+        .toISOString()
+        .slice(0, 10)}.xlsx`;
+
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([wbout], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;charset=UTF-8",
+      });
+
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.style.display = "none";
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      }, 1000);
+    } catch (err) {
+      console.warn("Client-side Excel export failed, falling back to server route:", err);
+      window.location.href = `/api/reports/export?branch=${encodeURIComponent(
+        branchFilter
+      )}&salesman=${encodeURIComponent(salesmanFilter)}&approvalStatus=${encodeURIComponent(approvalStatusFilter)}`;
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // CSV Export with All Fields (same columns as the Excel ledger sheet)
+  const exportToCSV = () => {
+    const rows = buildLedgerRows(filteredDeals);
+    const headers = rows.length
+      ? Object.keys(rows[0])
+      : Object.keys(buildLedgerRows([{ d: {}, c: {}, dt: new Date(), salesman: "", branchNorm: "" }])[0]);
+    const clean = (v) => (typeof v === "number" ? v : `"${String(v ?? "").replace(/"/g, '""')}"`);
+    const lines = rows.map((r) => headers.map((h) => clean(r[h])).join(","));
+
+    const csvContent = "\uFEFF" + [headers.map((h) => `"${h}"`).join(","), ...lines].join("\r\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.style.display = "none";
+    link.href = url;
+    link.download = `${isSales ? "magadh_Autowheels_My_Sales_Report" : "magadh_Autowheels_Sales_Report"}_${new Date()
+      .toISOString()
+      .slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => {
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }, 1000);
+  };
+
+  return (
+    <div className="space-y-6 animate-in fade-in duration-200">
+      {/* ---------------------------------------------------------------- */}
+      {/* 0. Printable letterhead report (visible ONLY when printing)       */}
+      {/* ---------------------------------------------------------------- */}
+      <ReportPrintSheet
+        activeView={activeView}
+        isSales={isSales}
+        session={session}
+        filteredDeals={filteredDeals}
+        timelineData={timelineData}
+        timelineGrouping={timelineGrouping}
+        salesmanLeaderboard={salesmanLeaderboard}
+        metrics={metrics}
+        filters={{
+          timePreset,
+          fromDate,
+          toDate,
+          branchFilter,
+          salesmanFilter,
+          approvalStatusFilter,
+          paymentModeFilter,
+          paymentStatusFilter,
+          searchQuery,
+        }}
+      />
+
+      {/* Everything below is the on-screen dashboard — hidden when printing */}
+      <div className="space-y-6 no-print print:hidden">
+        {/* ---------------------------------------------------------------- */}
+        {/* 1. Executive Top Header Banner                                   */}
+        {/* ---------------------------------------------------------------- */}
+        <div className="bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 rounded-xl p-5 text-white shadow-md border border-slate-800">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                <span className="p-1.5 rounded-lg bg-blue-600 text-white">
+                  <BarChart3 className="w-5 h-5" />
+                </span>
+                <h1
+                  className="text-2xl font-bold tracking-wide text-white uppercase"
+                  style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+                >
+                  {isAdmin
+                    ? "magadh Autowheels Pvt. Ltd. Â· Executive Dashboard"
+                    : isSales
+                      ? "magadh Autowheels Pvt. Ltd. Â· My Sales Report"
+                      : "magadh Autowheels Pvt. Ltd. Â· Sales Report"}
+                </h1>
+                {isAdmin ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                    <Shield className="w-3.5 h-3.5 text-amber-400" />
+                    Admin Executive Privilege
+                  </span>
+                ) : isSales ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-2.5 py-0.5 rounded-full">
+                    <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    Sales Executive: {session?.name} · {normalizeBranch(session?.branch)}
+                  </span>
+                ) : (
+                  <span className="text-[11px] font-semibold bg-blue-500/20 text-blue-300 border border-blue-500/30 px-2 py-0.5 rounded-full">
+                    magadh Autowheels Pvt. Ltd. ERP · {normalizeBranch(session?.branch)}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-300 max-w-2xl">
+                {isSales
+                  ? "Track your closed sales deals, timeline performance, payment collection receipts, and outstanding customer balances."
+                  : "magadh Autowheels Pvt. Ltd. ERP — Track ongoing day-wise, week-wise, monthly, and yearly sales performance with salesman drilldowns, collected revenue, outstanding customer dues, and payment UTR verifications."}
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => window.print()}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold shadow-md transition-all active:scale-95"
+                title="Print current report view"
+              >
+                <Printer className="w-4 h-4 text-blue-100" />
+                Print Report
+              </button>
+              <button
+                type="button"
+                onClick={downloadExcel}
+                disabled={isExporting}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md transition-all active:scale-95 disabled:opacity-50"
+                title="Download Microsoft Excel spreadsheet (.xlsx)"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-100" />
+                {isExporting ? "Generating Excel…" : isSales ? "Export My Report (.xlsx)" : "Download Excel Sheet (.xlsx)"}
+              </button>
+              <button
+                type="button"
+                onClick={exportToCSV}
+                className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700 transition-colors"
+                title="Download raw CSV file"
+              >
+                <Download className="w-3.5 h-3.5" />
+                CSV
+              </button>
+              {hasActiveFilters && (
+                <button
+                  type="button"
+                  onClick={handleResetFilters}
+                  className="flex items-center gap-1 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 transition-colors"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Reset Filters
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Quick Sales Counters Row */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 mt-4 pt-4 border-t border-slate-800/80">
+            {[
+              { id: "today", title: isSales ? "My Sales Today" : "Sales Today", data: quickCounters.today },
+              { id: "this_week", title: isSales ? "My Deals This Week" : "This Week", data: quickCounters.week },
+              { id: "this_month", title: isSales ? "My Deals This Month" : "This Month", data: quickCounters.month },
+              { id: "this_year", title: isSales ? "My Deals This Year" : "This Year", data: quickCounters.year },
+            ].map((item) => {
+              const active = timePreset === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setTimePreset(active ? "all" : item.id)}
+                  className={`text-left p-2.5 rounded-lg border transition-all ${active
+                    ? "bg-blue-600/30 border-blue-400 text-white ring-1 ring-blue-400"
+                    : "bg-slate-800/60 border-slate-700/60 text-slate-300 hover:bg-slate-800 hover:border-slate-600"
+                    }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                      {item.title}
+                    </span>
+                    <span
+                      className={`text-xs px-1.5 py-0.5 rounded font-mono font-bold ${active ? "bg-blue-500 text-white" : "bg-slate-700 text-blue-300"
+                        }`}
+                    >
+                      {item.data.count} {item.data.count === 1 ? "deal" : "deals"}
+                    </span>
+                  </div>
+                  <div
+                    className="text-lg font-bold mt-1 text-white"
+                    style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+                  >
+                    {inr(item.data.net)}
+                  </div>
+                  <div className="text-[10px] text-emerald-400 font-medium">
+                    Collected: {inr(item.data.collected)}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ---------------------------------------------------------------- */}
+        {/* 2. Executive Multi-Filter Bar                                     */}
+        {/* ---------------------------------------------------------------- */}
+        <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-3">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-xs font-bold text-slate-600 uppercase tracking-wider mr-1 flex items-center gap-1">
+              <Calendar className="w-3.5 h-3.5 text-blue-700" /> Timeframe:
+            </span>
+            {[
+              { id: "all", label: "All Time" },
+              { id: "today", label: "Today" },
+              { id: "this_week", label: "This Week" },
+              { id: "this_month", label: "This Month" },
+              { id: "this_year", label: "This Year" },
+              { id: "custom", label: "Custom Range" },
+            ].map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setTimePreset(t.id)}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-colors ${timePreset === t.id
+                  ? "bg-blue-700 text-white shadow-sm"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  }`}
+              >
+                {t.label}
+              </button>
+            ))}
+
+            {timePreset === "custom" && (
+              <div className="flex items-center gap-2 mt-2 sm:mt-0 flex-wrap bg-blue-50/60 border border-blue-200 rounded-lg p-1.5">
+                <div className="flex items-center gap-1 text-xs text-slate-700">
+                  <span className="font-semibold text-[11px]">From:</span>
+                  <input
+                    type="date"
+                    value={fromDate}
+                    onChange={(e) => setFromDate(e.target.value)}
+                    className="bg-white border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:ring-1 focus:ring-blue-600"
+                  />
+                </div>
+                <div className="flex items-center gap-1 text-xs text-slate-700">
+                  <span className="font-semibold text-[11px]">To:</span>
+                  <input
+                    type="date"
+                    value={toDate}
+                    onChange={(e) => setToDate(e.target.value)}
+                    className="bg-white border border-slate-300 rounded px-2 py-1 text-xs outline-none focus:ring-1 focus:ring-blue-600"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 pt-2 border-t border-slate-100">
+            {/* Salesman Filter */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+                <Users className="w-3 h-3 text-blue-600" /> Sales Executive
+              </label>
+              {isAdmin ? (
+                <select
+                  value={salesmanFilter}
+                  onChange={(e) => setSalesmanFilter(e.target.value)}
+                  className="w-full text-xs border border-slate-300 rounded-md px-2.5 py-1.5 bg-white font-medium focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 outline-none"
+                >
+                  <option value="all">All Salesmen ({allSalesmen.length})</option>
+                  {allSalesmen.map((sm) => (
+                    <option key={sm} value={sm}>
+                      {sm}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div className="w-full text-xs border border-blue-200 bg-blue-50/70 rounded-md px-2.5 py-1.5 font-bold text-blue-900 flex items-center justify-between">
+                  <span className="truncate">{session?.name || "My Account"}</span>
+                  <span className="text-[10px] bg-blue-200/80 text-blue-800 px-1.5 py-0.5 rounded font-semibold shrink-0">
+                    My Deals
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Branch Filter */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+                <Building2 className="w-3 h-3 text-blue-600" /> Dealership Branch
+              </label>
+              <select
+                value={branchFilter}
+                onChange={(e) => setBranchFilter(e.target.value)}
+                className="w-full text-xs border border-slate-300 rounded-md px-2.5 py-1.5 bg-white font-medium focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 outline-none"
+              >
+                <option value="all">All Branches (Sasaram, Bihiya, Buxas, Mohaniya)</option>
+                {BRANCHES.map((b) => (
+                  <option key={b} value={b}>
+                    {b}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Approval / Deal Status Filter */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+                <ShieldCheck className="w-3 h-3 text-blue-600" /> Approval / Status
+              </label>
+              <select
+                value={approvalStatusFilter}
+                onChange={(e) => setApprovalStatusFilter(e.target.value)}
+                className="w-full text-xs border border-slate-300 rounded-md px-2.5 py-1.5 bg-white font-medium focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 outline-none"
+              >
+                <option value="all">All Statuses</option>
+                <option value="approved">✅ Approved Deals</option>
+                <option value="pending">⏳ Pending Approval</option>
+                <option value="rejected">❌ Rejected Deals</option>
+              </select>
+            </div>
+
+            {/* Payment Mode Filter */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+                <CreditCard className="w-3 h-3 text-blue-600" /> Payment Mode
+              </label>
+              <select
+                value={paymentModeFilter}
+                onChange={(e) => setPaymentModeFilter(e.target.value)}
+                className="w-full text-xs border border-slate-300 rounded-md px-2.5 py-1.5 bg-white font-medium focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 outline-none"
+              >
+                <option value="all">All Modes (Cash, Cheque, RTGS, etc.)</option>
+                {PAYMENT_MODES.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Payment Status / Dues Filter */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wide mb-1 flex items-center gap-1">
+                <Wallet className="w-3 h-3 text-blue-600" /> Dues / Settlement
+              </label>
+              <select
+                value={paymentStatusFilter}
+                onChange={(e) => setPaymentStatusFilter(e.target.value)}
+                className="w-full text-xs border border-slate-300 rounded-md px-2.5 py-1.5 bg-white font-medium focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 outline-none"
+              >
+                <option value="all">All Settlements</option>
+                <option value="dues">⚠️ Has Outstanding Dues (Pending)</option>
+                <option value="settled">✅ Fully Paid / Cleared</option>
+                <option value="partial">🔄 Partial Payment Logged</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Live Search Bar */}
+          <div className="relative pt-1">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search by customer name, company, phone, chassis number, deal ID, or payment UTR / Cheque Ref..."
+              className="w-full pl-9 pr-8 py-2 text-xs border border-slate-300 rounded-lg bg-slate-50 focus:bg-white outline-none focus:ring-2 focus:ring-blue-600/30 focus:border-blue-600 transition-all"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery("")}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* ---------------------------------------------------------------- */}
+        {/* 3. Filtered KPI Overview Cards                                    */}
+        {/* ---------------------------------------------------------------- */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+            <div className="flex items-center justify-between text-xs uppercase tracking-wide text-slate-500 font-semibold">
+              <span>{isSales ? "My Sales" : "Total Sales"}</span>
+              <span className="text-[11px] font-mono font-bold bg-blue-50 text-blue-700 px-2 py-0.5 rounded">
+                {filteredDeals.length} / {scopedDeals.length}
+              </span>
+            </div>
+            <div
+              className="text-2xl font-bold mt-1.5 text-blue-900"
+              style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+            >
+              {filteredDeals.length} {filteredDeals.length === 1 ? "Deal" : "Deals"}
+            </div>
+            <div className="text-[11px] text-slate-500 mt-1">
+              Avg deal: <b className="text-slate-700">{inr(metrics.avgDeal)}</b>
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+            <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold">
+              {isSales ? "My Net Order Value" : "Net Order Value"}
+            </div>
+            <div
+              className="text-2xl font-bold mt-1.5 text-slate-900"
+              style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+            >
+              {inr(metrics.totalNet)}
+            </div>
+            <div className="text-[11px] text-slate-500 mt-1">Total revenue on-road</div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+            <div className="flex items-center justify-between text-xs uppercase tracking-wide text-slate-500 font-semibold">
+              <span>{isSales ? "My Collected" : "Collected"}</span>
+              <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">
+                {metrics.collectionRate}%
+              </span>
+            </div>
+            <div
+              className="text-2xl font-bold mt-1.5 text-emerald-700"
+              style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+            >
+              {inr(metrics.totalCollected)}
+            </div>
+            <div className="w-full bg-slate-100 rounded-full h-1.5 mt-2 overflow-hidden">
+              <div
+                className="bg-emerald-600 h-full rounded-full transition-all"
+                style={{ width: `${metrics.collectionRate}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="bg-white border border-amber-200 rounded-xl p-4 shadow-sm bg-gradient-to-br from-white to-amber-50/40">
+            <div className="flex items-center justify-between text-xs uppercase tracking-wide text-amber-800 font-semibold">
+              <span>{isSales ? "My Outstanding Dues" : "Outstanding Dues"}</span>
+              {metrics.duesCount > 0 && (
+                <span className="text-[10px] font-bold bg-amber-200 text-amber-900 px-1.5 py-0.5 rounded">
+                  {metrics.duesCount} pending
+                </span>
+              )}
+            </div>
+            <div
+              className="text-2xl font-bold mt-1.5 text-amber-700"
+              style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+            >
+              {inr(metrics.totalDue)}
+            </div>
+            <div className="text-[11px] text-amber-800 mt-1">
+              {isSales ? "Pending from my customers" : "Pending dealership collection"}
+            </div>
+          </div>
+        </div>
+
+        {/* ---------------------------------------------------------------- */}
+        {/* 4. Payment Modes Breakdown Pills                                  */}
+        {/* ---------------------------------------------------------------- */}
+        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm">
+          <div className="text-xs font-bold text-slate-700 uppercase tracking-wide mb-2 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <CreditCard className="w-4 h-4 text-blue-700" />
+              Payment Modes & Verified UTR Inflow
+            </span>
+            <span className="text-[11px] font-mono text-slate-500 font-normal">UTR count: {metrics.utrCount}</span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+            {[
+              { mode: "Cash", label: "💵 Cash", color: "text-emerald-800 bg-emerald-50/80 border-emerald-200" },
+              { mode: "NEFT/RTGS", label: "🏦 NEFT / RTGS", color: "text-blue-800 bg-blue-50/80 border-blue-200" },
+              { mode: "Financer Disbursement", label: "🏛️ Financer", color: "text-indigo-800 bg-indigo-50/80 border-indigo-200" },
+              { mode: "Cheque", label: "📝 Cheque", color: "text-purple-800 bg-purple-50/80 border-purple-200" },
+              { mode: "Advance Adjustment", label: "🔄 Advance Adjust", color: "text-slate-800 bg-slate-100 border-slate-200" },
+            ].map((item) => (
+              <div
+                key={item.mode}
+                onClick={() => setPaymentModeFilter(paymentModeFilter === item.mode ? "all" : item.mode)}
+                className={`p-2 rounded-lg border text-xs cursor-pointer transition-all ${item.color} ${paymentModeFilter === item.mode ? "ring-2 ring-blue-600" : "hover:shadow-sm"
+                  }`}
+              >
+                <div className="font-semibold text-[11px] truncate">{item.label}</div>
+                <div className="font-bold text-sm mt-0.5">{inr(metrics.modeTotals[item.mode] || 0)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ---------------------------------------------------------------- */}
+        {/* 5. Branch Sales Overview Card (Admin only)                        */}
+        {/* ---------------------------------------------------------------- */}
+        {isAdmin && (
+          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+            <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+              <div
+                className="font-bold text-slate-800 text-lg tracking-wide uppercase"
+                style={{ fontFamily: "'Barlow Condensed', sans-serif" }}
+              >
+                Branch Sales & Collection Distribution
+              </div>
+              <span className="text-xs font-semibold text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-200">
+                Sasaram · Bihiya · Buxas · Mohaniya
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              {branchBreakdown.map((bs) => (
+                <div
+                  key={bs.branch}
+                  onClick={() => setBranchFilter(branchFilter === bs.branch ? "all" : bs.branch)}
+                  className={`border rounded-lg p-3 space-y-2 cursor-pointer transition-all ${branchFilter === bs.branch
+                    ? "border-blue-600 bg-blue-50/70 shadow-sm ring-1 ring-blue-500"
+                    : "border-slate-200 bg-slate-50/70 hover:bg-slate-100/70"
+                    }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-slate-900 text-sm">{bs.branch}</span>
+                    <span className="text-xs font-bold bg-blue-100 text-blue-800 px-2 py-0.5 rounded">
+                      {bs.count} {bs.count === 1 ? "deal" : "deals"}
+                    </span>
+                  </div>
+                  <div className="text-xs space-y-1 text-slate-600">
+                    <div className="flex justify-between">
+                      <span>Order Value:</span>
+                      <b className="text-slate-800">{inr(bs.net)}</b>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Collected:</span>
+                      <b className="text-emerald-700">{inr(bs.collected)}</b>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Outstanding:</span>
+                      <b className={bs.balance > 0 ? "text-amber-700 font-bold" : "text-slate-500"}>
+                        {inr(bs.balance)}
+                      </b>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ---------------------------------------------------------------- */}
+        {/* 6. Dashboard Sub-Views                                            */}
+        {/* ---------------------------------------------------------------- */}
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+          <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50/80 px-4 pt-2 overflow-x-auto">
+            <div className="flex space-x-2">
+              {[
+                {
+                  id: "ledger",
+                  label: isSales ? "My Sales & Payment Ledger" : "Sales & Payment Ledger",
+                  icon: Layers,
+                  count: filteredDeals.length,
+                },
+                {
+                  id: "timeline",
+                  label: isSales ? "My Ongoing Timeline" : "Ongoing Timeline Details",
+                  icon: TrendingUp,
+                  count: timelineData.length,
+                },
+                ...(isAdmin
+                  ? [{ id: "salesmen", label: "Salesman Performance", icon: UserCheck, count: salesmanLeaderboard.length }]
+                  : []),
+              ].map((v) => (
+                <button
+                  key={v.id}
+                  type="button"
+                  onClick={() => setActiveView(v.id)}
+                  className={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-bold border-b-2 transition-colors whitespace-nowrap ${activeView === v.id
+                    ? "border-blue-700 text-blue-700 bg-white rounded-t-lg"
+                    : "border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100/50"
+                    }`}
+                >
+                  <v.icon className="w-3.5 h-3.5" />
+                  {v.label}
+                  <span className="text-[10px] bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded-full font-mono">
+                    {v.count}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {activeView === "timeline" && (
+              <div className="flex items-center gap-1 pb-1">
+                <span className="text-[11px] font-semibold text-slate-500 mr-1 hidden sm:inline">Group by:</span>
+                {[
+                  { id: "day", label: "Day-wise" },
+                  { id: "week", label: "Week-wise" },
+                  { id: "month", label: "Month-wise" },
+                ].map((g) => (
+                  <button
+                    key={g.id}
+                    type="button"
+                    onClick={() => setTimelineGrouping(g.id)}
+                    className={`text-[11px] px-2.5 py-1 rounded font-semibold transition-colors ${timelineGrouping === g.id
+                      ? "bg-blue-700 text-white"
+                      : "bg-slate-200 text-slate-600 hover:bg-slate-300"
+                      }`}
+                  >
+                    {g.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="p-4">
+            {/* VIEW 1: Sales & Payment Ledger Table */}
+            {activeView === "ledger" && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-xs text-slate-500 px-1">
+                  <div className="flex items-center gap-3">
+                    <span>
+                      Showing <b>{filteredDeals.length}</b> records matching filters
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => window.print()}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition-colors"
+                      title="Print Ledger Table"
+                    >
+                      <Printer className="w-3.5 h-3.5 text-slate-600" />
+                      Print Table
+                    </button>
+                  </div>
+                  {isAdmin && (
+                    <span className="text-[11px] text-blue-700 font-medium">
+                      Click "View" to inspect or edit any transaction.
+                    </span>
+                  )}
+                </div>
+
+                {filteredDeals.length === 0 ? (
+                  <div className="text-center py-12 text-slate-400 text-sm space-y-1">
+                    <AlertTriangle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                    <p className="font-semibold text-slate-600">
+                      {isSales ? "No deals found in your account" : "No sales deals found"}
+                    </p>
+                    <p className="text-xs">Try adjusting your timeframe or payment filters above.</p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                    <table className="w-full text-left text-xs text-slate-700">
+                      <thead className="bg-slate-100 text-slate-600 font-semibold uppercase tracking-wider text-[11px] border-b border-slate-200">
+                        <tr>
+                          <th className="py-2.5 px-3">Date & Deal ID</th>
+                          <th className="py-2.5 px-3">Customer & Mobile</th>
+                          <th className="py-2.5 px-3">{isSales ? "Branch & Model" : "Salesman & Branch"}</th>
+                          <th className="py-2.5 px-3 text-right">Net Order Value</th>
+                          <th className="py-2.5 px-3 text-right">Collected</th>
+                          <th className="py-2.5 px-3 text-right">Outstanding Due</th>
+                          <th className="py-2.5 px-3">Payment Modes & UTR Ref</th>
+                          <th className="py-2.5 px-3 text-center">Status</th>
+                          <th className="py-2.5 px-3 text-center">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {filteredDeals
+                          .slice()
+                          .reverse()
+                          .map(({ d, c, dt, salesman, branchNorm }) => {
+                            const validPayments = (d.paymentLog || []).filter((p) => paymentStatus(p) !== "rejected");
+                            return (
+                              <tr key={d.id} className="hover:bg-slate-50/80 transition-colors">
+                                <td className="py-2.5 px-3 font-mono">
+                                  <div className="font-bold text-slate-900">{d.id}</div>
+                                  <div className="text-[11px] text-slate-400">{formatDisplayDate(dt)}</div>
+                                </td>
+
+                                <td className="py-2.5 px-3">
+                                  <div className="font-semibold text-slate-800">{formatCustomer(d.customer)}</div>
+                                  <div className="text-[11px] text-slate-500 font-mono">
+                                    {d.customer?.mobile || "No phone"}
+                                    {d.vehicle?.model ? ` · ${d.vehicle.model}` : ""}
+                                  </div>
+                                </td>
+
+                                <td className="py-2.5 px-3">
+                                  <div className="font-medium text-slate-800">
+                                    {isSales ? d.vehicle?.model || "Commercial Vehicle" : salesman}
+                                  </div>
+                                  <span className="inline-block text-[10px] font-semibold bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded border border-blue-100">
+                                    {branchNorm}
+                                  </span>
+                                </td>
+
+                                <td className="py-2.5 px-3 text-right font-bold text-slate-900">{inr(c.netOnRoad)}</td>
+
+                                <td className="py-2.5 px-3 text-right font-semibold text-emerald-700">
+                                  {inr(c.totalCollected)}
+                                </td>
+
+                                <td className="py-2.5 px-3 text-right">
+                                  {c.balance > 0 ? (
+                                    <span className="font-bold text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">
+                                      {inr(c.balance)}
+                                    </span>
+                                  ) : (
+                                    <span className="text-emerald-700 font-medium text-[11px]">Paid in Full</span>
+                                  )}
+                                </td>
+
+                                <td className="py-2.5 px-3">
+                                  {validPayments.length === 0 ? (
+                                    <span className="text-slate-400 italic text-[11px]">No payment logged</span>
+                                  ) : (
+                                    <div className="space-y-1 max-w-xs">
+                                      {validPayments.map((p, idx) => (
+                                        <div
+                                          key={p.id || idx}
+                                          className="text-[11px] bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-slate-700 flex items-center justify-between gap-1"
+                                        >
+                                          <span className="font-semibold text-blue-800">{p.mode}:</span>
+                                          <span className="font-mono text-slate-600 truncate">
+                                            {p.reference ? `Ref/UTR: ${p.reference}` : "No ref"}
+                                          </span>
+                                          <span className="font-bold text-slate-900 shrink-0">{inr(p.amount)}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </td>
+
+                                <td className="py-2.5 px-3 text-center">
+                                  <span
+                                    className="inline-block px-2 py-0.5 rounded-full text-[10px] font-bold"
+                                    style={{
+                                      background: STATUS_META[d.status]?.bg || "#f1f2f4",
+                                      color: STATUS_META[d.status]?.color || "#6b7280",
+                                    }}
+                                  >
+                                    {STATUS_META[d.status]?.label || d.status}
+                                  </span>
+                                </td>
+
+                                <td className="py-2.5 px-3 text-center">
+                                  {onOpen && (
+                                    <button
+                                      type="button"
+                                      onClick={() => onOpen(d.id)}
+                                      className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 px-2.5 py-1 rounded transition-colors"
+                                    >
+                                      <Eye className="w-3.5 h-3.5" />
+                                      View
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* VIEW 2: Ongoing Timeline Grouped Details */}
+            {activeView === "timeline" && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-xs text-slate-500">
+                  <span>
+                    Tracking ongoing sales grouped <b>{timelineGrouping}-wise</b>. Showing <b>{timelineData.length}</b>{" "}
+                    time periods.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => window.print()}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition-colors"
+                    title="Print Timeline Report"
+                  >
+                    <Printer className="w-3.5 h-3.5 text-slate-600" />
+                    Print Timeline
+                  </button>
+                </div>
+
+                {timelineData.length === 0 ? (
+                  <div className="text-center py-12 text-slate-400 text-sm">
+                    No sales found in the selected timeframe.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {timelineData.map((group) => {
+                      const collectionRate = group.net > 0 ? Math.round((group.collected / group.net) * 100) : 0;
+                      return (
+                        <div
+                          key={group.key}
+                          className="bg-slate-50/70 border border-slate-200 rounded-lg p-3.5 hover:border-blue-300 transition-all"
+                        >
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2 border-b border-slate-200">
+                            <div>
+                              <span className="font-bold text-slate-900 text-sm">{group.label}</span>
+                              <span className="ml-2 text-xs font-bold bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">
+                                {group.deals.length} {group.deals.length === 1 ? "Sale" : "Sales"}
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-4 text-xs">
+                              <div>
+                                <span className="text-slate-500">Net Sales:</span>{" "}
+                                <b className="text-slate-900 text-sm">{inr(group.net)}</b>
+                              </div>
+                              <div>
+                                <span className="text-slate-500">Collected:</span>{" "}
+                                <b className="text-emerald-700">{inr(group.collected)}</b>
+                              </div>
+                              <div>
+                                <span className="text-slate-500">Dues:</span>{" "}
+                                <b className={group.balance > 0 ? "text-amber-700" : "text-slate-600"}>
+                                  {inr(group.balance)}
+                                </b>
+                              </div>
+                              <span className="text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded">
+                                {collectionRate}%
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="mt-2.5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                            {group.deals.map(({ d, c, salesman, branchNorm }) => (
+                              <div
+                                key={d.id}
+                                onClick={() => onOpen && onOpen(d.id)}
+                                className="bg-white border border-slate-200 rounded p-2 text-xs flex items-center justify-between gap-2 hover:border-blue-400 cursor-pointer"
+                              >
+                                <div className="min-w-0">
+                                  <div className="font-semibold text-slate-800 truncate">{formatCustomer(d.customer)}</div>
+                                  <div className="text-[11px] text-slate-500">
+                                    <span className="text-blue-700 font-medium">{branchNorm}</span> · {salesman} · {d.id}
+                                  </div>
+                                </div>
+                                <div className="text-right shrink-0">
+                                  <div className="font-bold text-slate-900">{inr(c.netOnRoad)}</div>
+                                  <div className="text-[10px] text-emerald-600">Rec: {inr(c.totalCollected)}</div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* VIEW 3: Salesman Performance Leaderboard (Admin only) */}
+            {isAdmin && activeView === "salesmen" && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-xs text-slate-500">
+                  <span>Track and compare salesman deal closures, revenue contribution, and collection efficiency.</span>
+                  <button
+                    type="button"
+                    onClick={() => window.print()}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition-colors"
+                    title="Print Salesman Leaderboard Report"
+                  >
+                    <Printer className="w-3.5 h-3.5 text-slate-600" />
+                    Print Leaderboard
+                  </button>
+                </div>
+
+                {salesmanLeaderboard.length === 0 ? (
+                  <div className="text-center py-12 text-slate-400 text-sm">
+                    No salesman activity in this filtered view.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                    <table className="w-full text-left text-xs text-slate-700">
+                      <thead className="bg-slate-100 text-slate-600 font-semibold uppercase tracking-wider text-[11px] border-b border-slate-200">
+                        <tr>
+                          <th className="py-2.5 px-3">Salesman Name</th>
+                          <th className="py-2.5 px-3">Primary Branch</th>
+                          <th className="py-2.5 px-3 text-center">Deals Count</th>
+                          <th className="py-2.5 px-3 text-center">Today's Sales</th>
+                          <th className="py-2.5 px-3 text-right">Net Sales Value</th>
+                          <th className="py-2.5 px-3 text-right">Amount Collected</th>
+                          <th className="py-2.5 px-3 text-right">Outstanding Dues</th>
+                          <th className="py-2.5 px-3 text-center">Collection %</th>
+                          <th className="py-2.5 px-3 text-center">Filter Salesman</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {salesmanLeaderboard.map((sm, index) => {
+                          const eff = sm.net > 0 ? Math.round((sm.collected / sm.net) * 100) : 0;
+                          const isFiltered = salesmanFilter === sm.name;
+                          return (
+                            <tr
+                              key={sm.name}
+                              className={`hover:bg-slate-50/80 transition-colors ${isFiltered ? "bg-blue-50/60 font-semibold" : ""
+                                }`}
+                            >
+                              <td className="py-2.5 px-3">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-[11px] text-slate-400 w-4">#{index + 1}</span>
+                                  <span className="font-bold text-slate-900">{sm.name}</span>
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-600">{sm.branch}</td>
+                              <td className="py-2.5 px-3 text-center font-bold text-blue-800">{sm.count}</td>
+                              <td className="py-2.5 px-3 text-center">
+                                {sm.todayCount > 0 ? (
+                                  <span className="font-bold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-full text-[11px]">
+                                    {sm.todayCount} today
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400">—</span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-bold text-slate-900">{inr(sm.net)}</td>
+                              <td className="py-2.5 px-3 text-right font-semibold text-emerald-700">
+                                {inr(sm.collected)}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-semibold text-amber-700">
+                                {sm.balance > 0 ? inr(sm.balance) : "₹0"}
+                              </td>
+                              <td className="py-2.5 px-3 text-center">
+                                <span className="font-bold text-xs text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-100">
+                                  {eff}%
+                                </span>
+                              </td>
+                              <td className="py-2.5 px-3 text-center">
+                                <button
+                                  type="button"
+                                  onClick={() => setSalesmanFilter(isFiltered ? "all" : sm.name)}
+                                  className={`text-[11px] px-2.5 py-1 rounded font-semibold transition-colors ${isFiltered
+                                    ? "bg-blue-700 text-white"
+                                    : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                                    }`}
+                                >
+                                  {isFiltered ? "Active Filter" : "Filter Deals"}
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
