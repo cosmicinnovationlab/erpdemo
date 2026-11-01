@@ -8,7 +8,7 @@ import React from "react";
 
 const DEALER = {
   name: "magadh Autowheels Pvt. Ltd.",
-  tagline: "Channel Partner for Commercial Vehicles of ",
+  tagline: " ",
   facility: "Corporate Office & 3S Facility",
   addresses: [
     "1. Kurdun H.N. A-2, Sasaram Road, Rohtas - 821113, Bihar",

@@ -1455,7 +1455,7 @@ export default function App() {
         <style>{CSS}</style>
         <div style={{ textAlign: "center" }}>
           <img
-            src="/magadh-logo.png"
+            src="/.png"
             alt="magadh Autowheels Pvt. Ltd."
             style={{ height: 48, width: "auto", margin: "0 auto 16px", background: "#fff", padding: "4px 8px", borderRadius: 8 }}
           />

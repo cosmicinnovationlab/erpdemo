@@ -115,7 +115,7 @@ export default function LoginPage({ onLoginSuccess }) {
           <div>
             <div className="brand disp">magadh Autowheels Pvt. Ltd.</div>
             <div style={{ fontSize: 11.5, color: "#8F897B" }}>
-              Channel Partner for Commercial Vehicles of
+
             </div>
           </div>
         </div>
@@ -126,7 +126,7 @@ export default function LoginPage({ onLoginSuccess }) {
             Commercial Vehicle <em>Sales &amp; Operations ERP</em>
           </h1>
           <p className="lead">
-            Official sales portal for magadh Autowheels Pvt. Ltd. — pricing quotation, bank audit verification, statutory RTO compliance, and deal management across our dealership network.
+            Official sales portal for magadh Autowheels Pvt. Ltd. — pricing quotation, bank audit verification, statutory RTO compliance, and deal management across your dealership network.
           </p>
           <div className="chips">
             {BRANCH_LIST.map((b) => (
